@@ -1,5 +1,5 @@
-;; Movie Box Office Prediction Market Contract - V2 (Enhanced)
-;; Added support for multiple prediction types and refund functionality
+;; Movie Box Office Prediction Market Contract - V3 (Final)
+;; Added support for multiple correct ranges and fixed multiplier predictions
 
 ;; Error Constants
 (define-constant contract-owner tx-sender)
@@ -12,6 +12,12 @@
 (define-constant ERR-INVALID-RANGE-COUNT (err u108))
 (define-constant ERR-INVALID-CLOSE-HEIGHT (err u109))
 (define-constant ERR-INVALID-PREDICTION-TYPE (err u110))
+(define-constant ERR-MISSING-MULTIPLIERS (err u111))
+(define-constant ERR-INVALID-RANGE (err u112))
+(define-constant ERR-NO-CORRECT-PREDICTIONS (err u114))
+(define-constant ERR-TOO-MANY-OUTCOMES (err u115))
+(define-constant ERR-INVALID-OUTCOME (err u116))
+(define-constant ERR-NOT-CORRECT (err u117))
 (define-constant ERR-REFUND-FAILED (err u118))
 (define-constant ERR-INVALID-MOVIE-DETAILS (err u120))
 (define-constant ERR-INVALID-PREDICTION-AMOUNT (err u121))
@@ -20,7 +26,7 @@
 (define-data-var next-prediction-id uint u0)
 
 ;; Prediction types
-(define-data-var prediction-types (list 10 (string-ascii 20)) (list "winner-takes-all" "weighted-share"))
+(define-data-var prediction-types (list 10 (string-ascii 20)) (list "winner-takes-all" "weighted-share" "fixed-multiplier"))
 
 ;; Define prediction structure
 (define-map predictions
@@ -31,9 +37,10 @@
     revenue-ranges: (list 10 (string-ascii 64)),
     total-predicted-amount: uint,
     is-prediction-open: bool,
-    correct-range: uint,
+    correct-ranges: (list 5 uint),
     prediction-close-height: uint,
-    prediction-type: (string-ascii 20)
+    prediction-type: (string-ascii 20),
+    multipliers: (optional (list 10 uint))
   }
 )
 
@@ -44,7 +51,7 @@
 )
 
 ;; Private functions
-(define-private (calculate-reward (prediction { creator: principal, movie-details: (string-ascii 256), revenue-ranges: (list 10 (string-ascii 64)), total-predicted-amount: uint, is-prediction-open: bool, correct-range: uint, prediction-close-height: uint, prediction-type: (string-ascii 20) }) (user-pred { chosen-range: uint, predicted-amount: uint }))
+(define-private (calculate-reward (prediction { creator: principal, movie-details: (string-ascii 256), revenue-ranges: (list 10 (string-ascii 64)), total-predicted-amount: uint, is-prediction-open: bool, correct-ranges: (list 5 uint), prediction-close-height: uint, prediction-type: (string-ascii 20), multipliers: (optional (list 10 uint)) }) (user-pred { chosen-range: uint, predicted-amount: uint }) (correct-range-ids (list 5 uint)))
   (let
     (
       (pred-type (get prediction-type prediction))
@@ -52,8 +59,46 @@
       (user-amount (get predicted-amount user-pred))
     )
     (if (is-eq pred-type "winner-takes-all")
-      total-pool
-      (/ (* user-amount total-pool) total-pool)
+      (/ total-pool (len correct-range-ids))
+      (if (is-eq pred-type "weighted-share")
+        (/ (* user-amount total-pool) total-pool)
+        (let
+          (
+            (multiplier-list (unwrap! (get multipliers prediction) u0))
+            (chosen-multiplier (unwrap! (element-at multiplier-list (- (get chosen-range user-pred) u1)) u0))
+          )
+          (+ user-amount (* user-amount (/ chosen-multiplier u100)))
+        )
+      )
+    )
+  )
+)
+
+(define-private (validate-ranges-helper (ranges (list 5 uint)) (max-range uint))
+  (let
+    (
+      (range-1 (element-at ranges u0))
+      (range-2 (element-at ranges u1))
+      (range-3 (element-at ranges u2))
+      (range-4 (element-at ranges u3))
+      (range-5 (element-at ranges u4))
+    )
+    (and
+      (match range-1
+        value (and (> value u0) (<= value max-range))
+        true)
+      (match range-2
+        value (and (> value u0) (<= value max-range))
+        true)
+      (match range-3
+        value (and (> value u0) (<= value max-range))
+        true)
+      (match range-4
+        value (and (> value u0) (<= value max-range))
+        true)
+      (match range-5
+        value (and (> value u0) (<= value max-range))
+        true)
     )
   )
 )
@@ -88,7 +133,7 @@
 )
 
 ;; Public functions
-(define-public (create-prediction (movie-details (string-ascii 256)) (revenue-ranges (list 10 (string-ascii 64))) (prediction-close-height uint) (prediction-type (string-ascii 20)))
+(define-public (create-prediction (movie-details (string-ascii 256)) (revenue-ranges (list 10 (string-ascii 64))) (prediction-close-height uint) (prediction-type (string-ascii 20)) (multipliers (optional (list 10 uint))))
   (let
     (
       (new-prediction-id (var-get next-prediction-id))
@@ -97,6 +142,7 @@
     (asserts! (> (len revenue-ranges) u1) ERR-INVALID-RANGE-COUNT)
     (asserts! (> prediction-close-height block-height) ERR-INVALID-CLOSE-HEIGHT)
     (asserts! (is-some (index-of (var-get prediction-types) prediction-type)) ERR-INVALID-PREDICTION-TYPE)
+    (asserts! (or (is-eq prediction-type "winner-takes-all") (is-eq prediction-type "weighted-share") (is-some multipliers)) ERR-MISSING-MULTIPLIERS)
     (map-set predictions
       { prediction-id: new-prediction-id }
       {
@@ -105,9 +151,10 @@
         revenue-ranges: revenue-ranges,
         total-predicted-amount: u0,
         is-prediction-open: true,
-        correct-range: u0,
+        correct-ranges: (list),
         prediction-close-height: prediction-close-height,
-        prediction-type: prediction-type
+        prediction-type: prediction-type,
+        multipliers: multipliers
       }
     )
     (var-set next-prediction-id (+ new-prediction-id u1))
@@ -122,6 +169,7 @@
     )
     (asserts! (> prediction-amount u0) ERR-INVALID-PREDICTION-AMOUNT)
     (asserts! (get is-prediction-open prediction) ERR-PREDICTION-CLOSED)
+    (asserts! (>= (len (get revenue-ranges prediction)) chosen-range) ERR-INVALID-RANGE)
     (try! (stx-transfer? prediction-amount tx-sender (as-contract tx-sender)))
     (map-set user-predictions
       { prediction-id: prediction-id, predictor: tx-sender }
@@ -151,17 +199,25 @@
   )
 )
 
-(define-public (settle-prediction (prediction-id uint) (winning-range uint))
+(define-public (settle-prediction (prediction-id uint) (winning-ranges (list 5 uint)))
   (let
     (
       (prediction (unwrap! (get-prediction prediction-id) ERR-DOES-NOT-EXIST))
     )
     (asserts! (is-eq contract-owner tx-sender) ERR-UNAUTHORIZED)
     (asserts! (get is-prediction-open prediction) ERR-PREDICTION-CLOSED)
-    (asserts! (is-eq (get correct-range prediction) u0) ERR-ALREADY-SETTLED)
+    (asserts! (is-eq (len (get correct-ranges prediction)) u0) ERR-ALREADY-SETTLED)
+    (asserts! (> (len winning-ranges) u0) ERR-NO-CORRECT-PREDICTIONS)
+    (asserts! (<= (len winning-ranges) u5) ERR-TOO-MANY-OUTCOMES)
+    (asserts! (validate-ranges-helper winning-ranges (len (get revenue-ranges prediction))) ERR-INVALID-OUTCOME)
     (map-set predictions
       { prediction-id: prediction-id }
-      (merge prediction { is-prediction-open: false, correct-range: winning-range })
+      (merge prediction 
+        { 
+          is-prediction-open: false,
+          correct-ranges: winning-ranges
+        }
+      )
     )
     (ok true)
   )
@@ -172,11 +228,12 @@
     (
       (prediction (unwrap! (get-prediction prediction-id) ERR-DOES-NOT-EXIST))
       (user-pred (unwrap! (get-user-prediction prediction-id tx-sender) ERR-DOES-NOT-EXIST))
+      (correct-range-ids (get correct-ranges prediction))
     )
-    (asserts! (is-eq (get chosen-range user-pred) (get correct-range prediction)) ERR-UNAUTHORIZED)
+    (asserts! (is-some (index-of correct-range-ids (get chosen-range user-pred))) ERR-NOT-CORRECT)
     (let
       (
-        (reward (calculate-reward prediction user-pred))
+        (reward (calculate-reward prediction user-pred correct-range-ids))
       )
       (try! (as-contract (stx-transfer? reward tx-sender tx-sender)))
       (map-delete user-predictions { prediction-id: prediction-id, predictor: tx-sender })
